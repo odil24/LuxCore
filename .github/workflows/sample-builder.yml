@@ -21,6 +21,8 @@ on:
         type: string
       version:
         description: 'The version to build - must comply to semver, or blank for default'
+        required: false
+        default: ''
         type: string
     outputs:
       commit:
@@ -66,10 +68,18 @@ jobs:
 
           # On Ubuntu, the clang SPIR-V target delegates to the external
           # SPIRV-LLVM-Translator: install the version matching the clang
-          # one and expose it with the name clang looks for
+          # one and expose it with the name clang looks for.
           CLANG_MAJOR=$(clang --version | grep -oE 'version [0-9]+' | grep -oE '[0-9]+')
-          sudo apt-get install -y "llvm-spirv-${CLANG_MAJOR}"
-          sudo ln -sf "/usr/bin/llvm-spirv-${CLANG_MAJOR}" /usr/local/bin/llvm-spirv
+
+          if sudo apt-get install -y "llvm-spirv-${CLANG_MAJOR}"; then
+            sudo ln -sf "/usr/bin/llvm-spirv-${CLANG_MAJOR}" /usr/local/bin/llvm-spirv
+          elif sudo apt-get install -y llvm-spirv; then
+            # Fallback: whatever llvm-spirv is available in the archive
+            sudo ln -sf "$(command -v llvm-spirv)" /usr/local/bin/llvm-spirv
+          else
+            echo "::error::Could not install a suitable llvm-spirv"
+            exit 1
+          fi
 
       - name: Bake the SPIR-V modules
         shell: bash
@@ -93,14 +103,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Enable additional targets here as the build support catches up.
         #os: [ubuntu-latest, windows-2022, macos-15, macos-15-intel, windows-11-arm]
-        os: windows-latest
+        os: [windows-latest]
     env:
       BUILD_TYPE: Release
-      #CXX_VERSION: 20
-      #GCC_VERSION: 14
-      #GLIBC_VERSION: 2_28
-      PYTHON_MINOR: ${{ matrix.python-minor }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OWNER: ${{ github.repository_owner }}
       REPO: ${{ github.event.repository.name }}
@@ -129,29 +136,41 @@ jobs:
 
       - name: Get current commit
         id: current-commit
+        shell: bash
         run: |
-          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-          echo "branch=$(git symbolic-ref HEAD)" >> $GITHUB_OUTPUT
-          echo "commit=$(git rev-parse HEAD)"
-          echo "branch=$(git symbolic-ref HEAD)"
+          commit=$(git rev-parse HEAD)
+          branch=$(git rev-parse --abbrev-ref HEAD)
+          # 'HEAD' means we are in a detached state (tag or SHA checkout)
+          if [ "$branch" = "HEAD" ]; then
+            branch=""
+          fi
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          echo "commit=${commit}"
+          echo "branch=${branch}"
 
       - name: Output version
         id: output-version
         shell: python
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           import os
           import json
           from pathlib import Path
 
-          if (input_version := "${{ inputs.release-version }}"):
+          input_version = os.environ.get("INPUT_VERSION", "").strip()
+          if input_version:
             version = input_version
           else:
             # Fall back to default
             build_settings_file = Path("build-system", "build-settings.json")
             with open(build_settings_file) as in_file:
               default_version = json.load(in_file)["DefaultVersion"]
-            version = ".".join(default_version[i] for i in ("major", "minor", "patch"))
-            if (prerelease := default_version["prerelease"]):
+            version = ".".join(
+              str(default_version[i]) for i in ("major", "minor", "patch")
+            )
+            if (prerelease := default_version.get("prerelease")):
               version = f"{version}-{prerelease}"
 
           print(f"Version: {version}")
@@ -164,19 +183,19 @@ jobs:
         run: |
           case ${{ runner.os }} in
             Linux) _workspace="/project";;
-            Windows) _workspace=$(cygpath -u $GITHUB_WORKSPACE);;
+            Windows) _workspace=$(cygpath -u "$GITHUB_WORKSPACE");;
             macOS) _workspace="$GITHUB_WORKSPACE";;
-            *) echo "Unhandled os ${{ runner.os }}";exit 64;;
+            *) echo "Unhandled os ${{ runner.os }}"; exit 64;;
           esac
-          echo "WORKSPACE=${_workspace}" >> $GITHUB_ENV
+          echo "WORKSPACE=${_workspace}" >> "$GITHUB_ENV"
 
       - name: Set Conan parameters
         shell: bash
         run: |
-            _build_type=$(echo "${{ env.BUILD_TYPE }}" | tr '[:upper:]' '[:lower:]')
-            _conan_home="${{ env.WORKSPACE }}/.conan2"
-            echo "CONAN_PRESET=conan-${_build_type}" >> $GITHUB_ENV
-            echo "CONAN_HOME=${_conan_home}" >> $GITHUB_ENV
+          _build_type=$(echo "${{ env.BUILD_TYPE }}" | tr '[:upper:]' '[:lower:]')
+          _conan_home="${{ env.WORKSPACE }}/.conan2"
+          echo "CONAN_PRESET=conan-${_build_type}" >> "$GITHUB_ENV"
+          echo "CONAN_HOME=${_conan_home}" >> "$GITHUB_ENV"
 
       - name: Configure ccache
         uses: actions/github-script@v7
@@ -185,29 +204,29 @@ jobs:
             const workspace = String.raw`${{ github.workspace }}`;
 
             const envVariables = {
-                'cache-variant': String.raw`ccache`,
-                'CMAKE_CXX_COMPILER_LAUNCHER': String.raw`ccache`,
-                'CMAKE_C_COMPILER_LAUNCHER': String.raw`ccache`,
-                'CCACHE_CONFIGPATH': String.raw`${workspace}/ccache.conf`,
-                'CCACHE_DIR': String.raw`${workspace}/.ccache`,
-                'CCACHE_DEBUGDIR': String.raw`${workspace}/ccache-debug`,
-                'CCACHE_LOGFILE': String.raw`${workspace}/ccache.log`
+              'cache-variant': String.raw`ccache`,
+              'CMAKE_CXX_COMPILER_LAUNCHER': String.raw`ccache`,
+              'CMAKE_C_COMPILER_LAUNCHER': String.raw`ccache`,
+              'CCACHE_CONFIGPATH': String.raw`${workspace}/ccache.conf`,
+              'CCACHE_DIR': String.raw`${workspace}/.ccache`,
+              'CCACHE_DEBUGDIR': String.raw`${workspace}/ccache-debug`,
+              'CCACHE_LOGFILE': String.raw`${workspace}/ccache.log`
             };
 
             for (const [key, value] of Object.entries(envVariables)) {
-                core.exportVariable(key, value);
+              core.exportVariable(key, value);
             }
 
       - uses: actions/setup-python@v5
         with:
-          python-version: 3.13
+          python-version: "3.13"
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           create-symlink: false
           variant: ${{ env.cache-variant }}
-          key: samples-${{ matrix.os }}
+          key: samples-${{ matrix.os }}-${{ env.BUILD_TYPE }}
           max-size: 5G
           verbose: 1
 
@@ -233,70 +252,115 @@ jobs:
           LUXRAYS_SPIRV_BAKED_DIR: ${{ github.workspace }}\spirv-baked
         run: |
           rem We have to install 'wheel', despite it is useless for samples,
-          rem Otherwise 'make deps' will complain
+          rem otherwise 'make deps' will complain
+          pip install conan
+          if errorlevel 1 exit /b 1
+          pip install wheel
+          if errorlevel 1 exit /b 1
+          make deps
+          if errorlevel 1 exit /b 1
+          make luxcore
+          if errorlevel 1 exit /b 1
+          make luxcoreui
+          if errorlevel 1 exit /b 1
+          make luxcoreconsole
+          if errorlevel 1 exit /b 1
 
-          pip install conan && pip install wheel && make deps && make luxcore && make luxcoreui && make luxcoreconsole
-
-        # run contains code that'll be executed on host side
+      - name: Build (Linux, manylinux container)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CONTAINER: luxcore-build
+          COMMAND: >-
+            pip install conan wheel &&
+            make deps &&
+            make luxcore &&
+            make luxcoreui &&
+            make luxcoreconsole
         run: |
+          set -euo pipefail
+
           # Clean (remove container if it exists)
           CONTAINER_LIST=$(docker container ps -a)
-          if [[ ${CONTAINER_LIST} == *${{ env.CONTAINER }}* ]]; then
+          if [[ ${CONTAINER_LIST} == *"${{ env.CONTAINER }}"* ]]; then
             echo "Removing existing container '${{ env.CONTAINER }}'"
-            docker rm --force ${{ env.CONTAINER }}
+            docker rm --force "${{ env.CONTAINER }}"
           fi
 
           # Start
           echo ""
-          echo "******** LAUCHING MANYLINUX CONTAINER ********"
+          echo "******** LAUNCHING MANYLINUX CONTAINER ********"
           echo ""
           docker create \
             -t \
-            --name ${{ env.CONTAINER }} \
+            --name "${{ env.CONTAINER }}" \
             quay.io/pypa/manylinux_2_28_x86_64
-          docker start ${{ env.CONTAINER }}
-          docker exec ${{ env.CONTAINER }} env
+          docker start "${{ env.CONTAINER }}"
+          docker exec "${{ env.CONTAINER }}" env
 
           # Copy source tree
-          docker exec ${{ env.CONTAINER }} sh -c "echo Copying source tree"
-          docker cp ${{ github.workspace }} ${{ env.CONTAINER }}:/project
+          docker exec "${{ env.CONTAINER }}" sh -c "echo Copying source tree"
+          docker cp "${{ github.workspace }}" "${{ env.CONTAINER }}:/project"
 
-          # Copy ccache
-          echo "Copying ${{ env.CCACHE_DIR }} to container"
-          docker cp ${{ env.CCACHE_DIR }}/. ${{ env.CONTAINER }}:/root/.ccache
+          # Copy ccache (best-effort, dir may be empty)
+          if [ -d "${CCACHE_DIR:-/nonexistent}" ]; then
+            echo "Copying ${CCACHE_DIR} to container"
+            docker cp "${CCACHE_DIR}/." "${{ env.CONTAINER }}:/root/.ccache"
+          fi
 
           # Execute COMMAND in container
-          docker exec --workdir=/project ${{ env.CONTAINER }} sh -c '${{ env.COMMAND }}'
+          docker exec --workdir=/project "${{ env.CONTAINER }}" sh -c "${{ env.COMMAND }}"
 
           # Copy ccache back
-          docker cp ${{ env.CONTAINER }}:/root/.ccache/. ${{ env.CCACHE_DIR }}
+          docker cp "${{ env.CONTAINER }}:/root/.ccache/." "${CCACHE_DIR}"
 
           # Get artifact
-          mkdir -p ${{ github.workspace }}/out/build
-          docker cp ${{ env.CONTAINER }}:/project/out ${{ github.workspace }}
+          mkdir -p "${{ github.workspace }}/out/build"
+          docker cp "${{ env.CONTAINER }}:/project/out" "${{ github.workspace }}"
 
           # Stop container
-          docker stop ${{ env.CONTAINER }}
+          docker stop "${{ env.CONTAINER }}"
 
           # Remove superfluous files (hack)
-          rm -f ${{ github.workspace }}/out/install/Release/lib/libnvrtc*.alt.*
+          rm -f "${{ github.workspace }}/out/install/Release/lib/libnvrtc"*.alt.*
 
       #- name: Setup tmate session (debug)
         #if: ${{ failure() }}
         #uses: mxschmitt/action-tmate@v3
 
-      - name: Install 7zip (act)
-        if: ${{ env.ACT }}
+      - name: Install 7zip (non-Windows)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          apt install -y p7zip-full
+          case "${{ runner.os }}" in
+            Linux)
+              sudo apt-get update -y
+              sudo apt-get install -y p7zip-full
+              ;;
+            macOS)
+              brew install p7zip
+              ;;
+            *)
+              echo "::error::Don't know how to install 7z on ${{ runner.os }}"
+              exit 1
+              ;;
+          esac
 
       - name: Bundle artifacts
         working-directory: ${{ github.workspace }}/out/install
         shell: bash
         run: |
-          mv Release LuxCore
-          7z a -snl ../../LuxCoreSamples-${{ runner.os }}-${{ runner.arch }}.zip LuxCore/
+          set -euo pipefail
+          # Multi-config generators (MSVC) put binaries under Release/,
+          # single-config ones may put them directly under install/.
+          if [ -d Release ]; then
+            mv Release LuxCore
+          elif [ ! -d LuxCore ]; then
+            echo "::error::Expected install directory (Release or LuxCore) not found in $(pwd)"
+            ls -la
+            exit 1
+          fi
+          7z a -snl "../../LuxCoreSamples-${{ runner.os }}-${{ runner.arch }}.zip" LuxCore/
 
       # Upload artifacts
       - uses: actions/upload-artifact@v4
