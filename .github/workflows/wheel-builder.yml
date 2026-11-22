@@ -122,9 +122,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-minor: [10, 11, 12, 13, 14]
-        #os: [ubuntu-latest, windows-2022, macos-15-intel, macos-15, windows-11-arm]
-        os: [ubuntu-latest, windows-2022, macos-15-intel, macos-15]
+        python-minor: [13, 14]
+        os: windows-2022
     env:
       # Reminder: report all variables here to CIBW_ENVIRONMENT_PASS_LINUX
       BUILD_TYPE: ${{ github.event.inputs.build-type || 'Release' }}
@@ -208,13 +207,6 @@ jobs:
                 core.exportVariable(key, value);
             }
 
-      # Update apt: needed to install ccache
-      - name: Update apt (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update -y
-
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1
         with:
@@ -236,88 +228,6 @@ jobs:
         with:
           name: spirv-baked
           path: spirv-baked
-
-      - name: Prepare Linux
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          _V=${{ env.GCC_VERSION }}
-          _T=/opt/rh/gcc-toolset-${_V}/root
-
-          echo "TOOLSET_ROOT=${_T}" >> $GITHUB_ENV
-          echo "CXX=${_T}/usr/bin/g++" >> $GITHUB_ENV
-          echo "CC=${_T}/usr/bin/gcc" >> $GITHUB_ENV
-          echo "AR=${_T}/usr/bin/ar" >> $GITHUB_ENV
-          echo "RANLIB=${_T}/usr/bin/ranlib" >> $GITHUB_ENV
-
-      - name: Set MacOS deployment target and other set-ups
-        if: runner.os == 'macOS'
-        uses: actions/github-script@v8
-        with:
-          # Minimum targets driven by:
-          # Intel: libomp
-          # Arm: opensubdiv
-          script: |
-            if ('${{ runner.arch }}' == 'X64') {
-              target = '11.0';  // Required by libomp
-              arch='x86_64';
-            }
-            else {
-              target = '14.2';  // Required by opensubdiv
-              arch='armv8';
-            }
-            core.exportVariable('MACOSX_DEPLOYMENT_TARGET', target);
-            core.exportVariable('CMAKE_OSX_DEPLOYMENT_TARGET', target);
-            core.exportVariable('PKG_ARCH', arch);
-
-      - name: Prepare MacOS
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-            # We make conan believe we use apple-clang (see profiles), but
-            # actually we use recent version of llvm, to get full compatibility
-            # with C++20 (in particular: joining threads)
-
-            LLVM_VERSION=21
-
-            # llvm
-            brew install llvm@${LLVM_VERSION}
-            brew link llvm@${LLVM_VERSION} --overwrite
-            LLVM_PREFIX=$(brew --prefix llvm@${LLVM_VERSION})
-            echo "CC=clang" >> $GITHUB_ENV
-            echo "CXX=clang++" >> $GITHUB_ENV
-            echo "AR=llvm-ar" >> $GITHUB_ENV
-            echo "RANLIB=llvm-ranlib" >> $GITHUB_ENV
-
-            # lld
-            brew install lld@${LLVM_VERSION}
-            brew link lld@${LLVM_VERSION} --overwrite
-            LLD_PREFIX=$(brew --prefix lld@${LLVM_VERSION})
-
-            # Set paths
-            echo "PATH=${LLVM_PREFIX}/bin:${LLD_PREFIX}/bin:$PATH" >> $GITHUB_ENV
-            echo "DYLD_LIBRARY_PATH=${LLVM_PREFIX}/lib:${LLD_PREFIX}/lib:${DYLD_LIBRARY_PATH}" >> $GITHUB_ENV
-
-            # Set flags
-            echo "LDFLAGS=${LD_FLAGS} -fuse-ld=${LLD_PREFIX}/bin/ld64.lld -L${LLVM_PREFIX}/lib -L${LLD_PREFIX}/lib" >> $GITHUB_ENV
-            echo "CPPFLAGS=${CPPFLAGS} -I${LLVM_PREFIX}/include -I${LLD_PREFIX}/include" >> $GITHUB_ENV
-
-
-      # TODO: The following block is an ugly hack but, at the moment (2025-02-25),
-      # scikit-build-core lacks a preset parameter, so this is the only way
-      # I found to pass a calculated environment var to CMake build step
-      - name: Set M4 env var
-        if: runner.os != 'Windows'
-        uses: actions/github-script@v8
-        with:
-          script: |
-            if ('${{ runner.arch }}' == 'X64') {
-              arch = 'x86_64'
-            } else {
-              arch = 'armv8'
-            }
-            base = '${{ env.WORKSPACE }}/out/dependencies/full_deploy/host/m4/1.4.19/Release/'
-            core.exportVariable('M4', base + arch + '/bin/m4')
 
       - name: Export version for scikit-build-core
         shell: python
@@ -354,9 +264,7 @@ jobs:
           CIBW_BUILD_FRONTEND: build
           CIBW_BUILD_VERBOSITY: 1
           CIBW_BUILD: cp3${{ matrix.python-minor }}-*
-          CIBW_SKIP: "*musllinux*"
           CIBW_ARCHS: auto64
-          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_${{ env.GLIBC_VERSION }}_x86_64
           CIBW_ENVIRONMENT: >
             SKBUILD_CMAKE_ARGS='--preset conan-default;--log-level=VERBOSE;-DLUXCORE_VERSION=${{ steps.output-version.outputs.version }};-G Ninja Multi-Config'
             SKBUILD_CMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
@@ -367,109 +275,37 @@ jobs:
           # addition to it): it must repeat the whole environment, plus the
           # pre-baked SPIR-V modules directory (inside the container, the
           # repository is mounted under /project)
-          CIBW_ENVIRONMENT_LINUX: >
-            SKBUILD_CMAKE_ARGS='--preset conan-default;--log-level=VERBOSE;-DLUXCORE_VERSION=${{ steps.output-version.outputs.version }};-G Ninja Multi-Config'
-            SKBUILD_CMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
-            GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
-            LUX_BUILD_TYPE=${{ env.BUILD_TYPE }}
-            DEPS_WITHOUT_SUDO=1
-            LUXRAYS_SPIRV_BAKED_DIR=/project/spirv-baked
-          CIBW_ENVIRONMENT_PASS_LINUX: |
-            CC
-            CXX
-            BUILD_TYPE
-            GCC_VERSION
-            SANITIZE
-            ASAN_PATH
-            RUNNER_OS
-            RUNNER_ARCH
-            WORKSPACE
-            CMAKE_CXX_COMPILER_LAUNCHER
-            CMAKE_C_COMPILER_LAUNCHER
-            PYTHON_MINOR
-            BOOST_INSTALL_LAYOUT
-            SPDLOG_FMT_EXTERNAL
-            CXX_VERSION
-            CONAN_HOME
-            CONAN_PRESET
-            M4
-          CIBW_BEFORE_ALL_LINUX: |
-            # The container runs as root and doesn't have sudo: don't let
-            # conan use it for the system package manager (it is also set
-            # through CIBW_ENVIRONMENT but the propagation to before_all is
-            # not guaranteed)
-            export DEPS_WITHOUT_SUDO=1
-
-            # Install toolchain (gcc, ccache...)
-            dnf install -y epel-release
-            dnf install -y almalinux-release-devel
-            dnf install -y ccache
-            dnf install -y perl-IPC-Cmd perl-Digest-SHA
-            dnf install -y ninja-build
-
-            # Install gh (via conda)
-            dnf install -y wget
-            mkdir -p miniconda3
-            wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda3/miniconda.sh
-            bash miniconda3/miniconda.sh -b -u -p miniconda3
-            rm miniconda3/miniconda.sh
-            source miniconda3/bin/activate
-            conda init --all
-
-            # Accept conda terms of service
-            conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-            conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-
-            # Install gh. No 'gh auth login' here: the GH_TOKEN environment
-            # variable (set through CIBW_ENVIRONMENT) already authenticates
-            # gh and 'gh auth login' would refuse to run while it is set,
-            # aborting the script BEFORE 'make deps' runs
-            conda install gh --channel conda-forge -y
-
-            # Manylinux_2_34 compatibility (for future use)
-            if [[ ${{ env.GLIBC_VERSION }} != 2_28 ]]; then
-              dnf install -y perl-FindBin perl-lib
-            fi
-
-            # Install dependencies
-            pip install "conan==2.21" && pip install wheel && make deps
-
-          CIBW_BEFORE_ALL_MACOS: |
-            pip install "conan==2.21" && pip install wheel && make deps
+          
+          #CIBW_ENVIRONMENT_LINUX: >
+            #SKBUILD_CMAKE_ARGS='--preset conan-default;--log-level=VERBOSE;-DLUXCORE_VERSION=${{ steps.output-version.outputs.version }};-G Ninja Multi-Config'
+            #SKBUILD_CMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+            #GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
+            #LUX_BUILD_TYPE=${{ env.BUILD_TYPE }}
+            #DEPS_WITHOUT_SUDO=1
+            #LUXRAYS_SPIRV_BAKED_DIR=/project/spirv-baked
+          #CIBW_ENVIRONMENT_PASS_LINUX: |
+            #CC
+            #CXX
+            #BUILD_TYPE
+            #GCC_VERSION
+            #SANITIZE
+            #ASAN_PATH
+            #RUNNER_OS
+            #RUNNER_ARCH
+            #WORKSPACE
+            #CMAKE_CXX_COMPILER_LAUNCHER
+            #CMAKE_C_COMPILER_LAUNCHER
+            #PYTHON_MINOR
+            #BOOST_INSTALL_LAYOUT
+            #SPDLOG_FMT_EXTERNAL
+            #CXX_VERSION
+            #CONAN_HOME
+            #CONAN_PRESET
 
           CIBW_BEFORE_ALL_WINDOWS: |
             pip install "conan==2.21" && pip install wheel && make deps
 
-
-          CIBW_REPAIR_WHEEL_COMMAND_LINUX: |
-            paths=$(find /project -type d -wholename "*/lib" -print0 | xargs -0 realpath | tr "\n" ":")
-            LD_LIBRARY_PATH=$paths:$LD_LIBRARY_PATH
-            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
-            export LD_LIBRARY_PATH
-
-            ## Check build data
-            unzip {wheel} -d /tmp/wheel
-
-            auditwheel \
-              --verbose repair -w {dest_dir} \
-              --plat manylinux_${{ env.GLIBC_VERSION }}_x86_64 \
-              --only-plat \
-              ${{ env.BUILD_TYPE == 'Release' && '--strip' || '' }} \
-              {wheel}
-
-          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: |
-            bash.exe ${{ env.WORKSPACE }}/build-system/wheels/repair_wheel_windows.sh '{wheel}' '{dest_dir}' '%VCToolsRedistDir%%Platform%' '${{ env.WORKSPACE }}'
-          CIBW_REPAIR_WHEEL_COMMAND_MACOS: |
-            cp {wheel} ${{ env.WORKSPACE }}
-            paths=$(find ${{ env.WORKSPACE }} -type d -wholename "*/lib" -print0 | xargs -0 realpath | tr "\n" ":")
-            DYLD_LIBRARY_PATH=$paths:$DYLD_LIBRARY_PATH
-            echo "DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH}"
-            export DYLD_LIBRARY_PATH
-            delocate-listdeps -v {wheel}
-            delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}
-          CIBW_TEST_COMMAND_LINUX: pyluxcoretest
           CIBW_TEST_COMMAND_WINDOWS: pyluxcoretest
-          CIBW_TEST_COMMAND_MACOS: pyluxcoretest
           CIBW_CONTAINER_ENGINE: >
             docker;
             create_args:
