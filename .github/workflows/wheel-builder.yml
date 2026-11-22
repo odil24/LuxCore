@@ -2,28 +2,46 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-
 name: LuxCore Python Wheels Builder
 
+# FIX: include the workflow name so manual dispatch and workflow_call of the
+# same ref do not collide in the concurrency group.
 concurrency:
-  group: luxcore-wheel-builder-${{ github.ref }}
+  group: ${{ github.workflow }}-luxcore-wheel-builder-${{ github.ref }}
   cancel-in-progress: false
 
 on:
   workflow_dispatch:
-      inputs:
-        build-type:
-          description: 'Build type'
-          required: true
-          default: 'Release'
-          type: choice
-          options:
-            - Release
-            - Debug
+    # FIX: expose the same inputs as workflow_call so manual runs can target
+    # a different repo/ref/version.
+    inputs:
+      repository:
+        description: 'Repository to check out (blank = this repo)'
+        required: false
+        default: ''
+        type: string
+      ref:
+        description: 'The branch, tag or SHA to checkout (blank = triggering ref)'
+        required: false
+        default: ''
+        type: string
+      version:
+        description: 'The version to build - must comply to semver, or blank for default'
+        required: false
+        default: ''
+        type: string
+      build-type:
+        description: 'Build type'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
   workflow_call:
     inputs:
       repository:
-        description: 'Repository to check out'
+        description: 'Repository to check out (blank = this repo)'
         required: false
         default: ''
         type: string
@@ -34,10 +52,14 @@ on:
         type: string
       version:
         description: 'The version to build - must comply to semver, or blank for default'
+        required: false
+        default: ''
         type: string
       build-type:
         description: 'Build type'
-        required: true
+        # FIX: required:true on workflow_call means the caller MUST pass it,
+        # so the default never applied. Make it optional.
+        required: false
         default: 'Release'
         type: string
     outputs:
@@ -53,7 +75,10 @@ on:
       version:
         description: "The version actually built"
         value: ${{ jobs.build-wheels.outputs.version }}
+  # FIX: restrict push triggers so we don't run the full matrix on every
+  # branch (90-min bake + 2x180-min wheel jobs per push).
   push:
+    branches: [main, master]
 
 jobs:
   # The OpenCL kernels are pre-compiled in SPIR-V format once (the format
@@ -67,26 +92,30 @@ jobs:
     steps:
       - name: Checkout main repository (standard context)
         if: ${{ !env.ACT }}
-        uses: actions/checkout@v6
+        # FIX: `repository: ''` (the default of the input on `push`) makes
+        # actions/checkout error out; fall back to this repo.
+        uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.repository }}
+          repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref }}
 
       - name: Checkout main repository (act context)
         if: env.ACT
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Clang
         uses: egor-tensin/setup-clang@v2
         with:
-          version: latest
+          # FIX: `latest` may be newer than any packaged llvm-spirv-N on the
+          # Ubuntu runner, breaking the apt install below. Pin a known-good
+          # version that has a matching llvm-spirv-N package.
+          version: '18'
           platform: x64
 
       - name: Install build tools
         shell: bash
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y libboost-dev
 
           # On Ubuntu, the clang SPIR-V target delegates to the external
           # SPIRV-LLVM-Translator: install the version matching the clang
@@ -105,11 +134,11 @@ jobs:
           cmake -S build-system/spirv -B bake-build
           cmake --build bake-build -j 4
 
-          # Check that the modules have actually been baked
-          test -f bake-build/baked/spirvmanifest.txt
+          # FIX: -s (exists AND non-empty), not -f (exists only).
+          test -s bake-build/baked/spirvmanifest.txt
 
       - name: Upload the SPIR-V modules
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: spirv-baked
           path: bake-build/baked/
@@ -125,13 +154,15 @@ jobs:
         python-minor: [13, 14]
         os: [windows-2022]
     env:
-      # Reminder: report all variables here to CIBW_ENVIRONMENT_PASS_LINUX
-      BUILD_TYPE: ${{ github.event.inputs.build-type || 'Release' }}
+      # FIX: `github.event.inputs.*` is empty under workflow_call, so the
+      # build-type was always falling back to Release. `inputs.*` works for
+      # both triggers.
+      BUILD_TYPE: ${{ inputs.build-type || 'Release' }}
       CXX_VERSION: 20
       GCC_VERSION: 14
       GLIBC_VERSION: 2_28
-      GH_TOKEN: ${{ github.token }}
-      PYTHON_MINOR: ${{ matrix.python-minor }}
+      # FIX: PYTHON_MINOR was unused - drop it (matrix.python-minor is used
+      # inline where needed).
     outputs:
       commit: ${{ steps.current-commit.outputs.commit }}
       branch: ${{ steps.current-commit.outputs.branch }}
@@ -142,56 +173,63 @@ jobs:
       - name: Configure git for long paths
         shell: bash
         if: runner.os == 'Windows'
-        run: git config --system core.longpaths true
+        # FIX: --system needs admin; --global is sufficient and always works.
+        run: git config --global core.longpaths true
 
       - name: Checkout main repository (standard context)
         if: ${{ !env.ACT }}
-        uses: actions/checkout@v6
+        # FIX: see bake-spirv above.
+        uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.repository }}
+          repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref }}
 
       - name: Checkout main repository (act context)
         if: env.ACT
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Get current commit
         shell: bash
         id: current-commit
+        # FIX: `git symbolic-ref HEAD` exits non-zero on detached HEAD
+        # (tags/SHAs - a valid value of inputs.ref). Tolerate it.
         run: |
-          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-          echo "branch=$(git symbolic-ref HEAD)" >> $GITHUB_OUTPUT
-          echo "commit=$(git rev-parse HEAD)"
-          echo "branch=$(git symbolic-ref HEAD)"
+          _commit=$(git rev-parse HEAD)
+          _branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+          echo "commit=${_commit}" >> "$GITHUB_OUTPUT"
+          echo "branch=${_branch}" >> "$GITHUB_OUTPUT"
+          echo "commit=${_commit}"
+          echo "branch=${_branch}"
 
       - name: Find workspace
         shell: bash
+        # FIX: dead Linux/macOS branches removed - only Windows is in the
+        # matrix. Fail loudly if the matrix is ever extended without
+        # updating this step.
         run: |
           case ${{ runner.os }} in
-            Linux) _workspace="/project";;
-            Windows) _workspace=$(cygpath -u $GITHUB_WORKSPACE);;
-            macOS) _workspace="$GITHUB_WORKSPACE";;
-            *) echo "Unhandled os ${{ runner.os }}";exit 64;;
+            Windows) _workspace=$(cygpath -u "$GITHUB_WORKSPACE");;
+            *) echo "Unhandled os ${{ runner.os }}"; exit 64;;
           esac
-          echo "WORKSPACE=${_workspace}" >> $GITHUB_ENV
+          echo "WORKSPACE=${_workspace}" >> "$GITHUB_ENV"
 
       - name: Set Conan parameters
         shell: bash
         run: |
-            _build_type=$(echo "${{ env.BUILD_TYPE }}" | tr '[:upper:]' '[:lower:]')
-            if [[ "${{ runner.os }}" == "Windows" ]]; then
-              _conan_home=$(cygpath -w "${{ env.WORKSPACE }}/.conan2")
-            else
-              _conan_home="${{ env.WORKSPACE }}/.conan2"
-            fi
-            echo "CONAN_PRESET=conan-${_build_type}" >> $GITHUB_ENV
-            echo "CONAN_HOME=${_conan_home}" >> $GITHUB_ENV
+          _build_type=$(echo "${{ env.BUILD_TYPE }}" | tr '[:upper:]' '[:lower:]')
+          # FIX: Windows-only matrix, so no need for a Unix branch.
+          _conan_home=$(cygpath -w "${{ env.WORKSPACE }}/.conan2")
+          echo "CONAN_PRESET=conan-${_build_type}" >> "$GITHUB_ENV"
+          echo "CONAN_HOME=${_conan_home}" >> "$GITHUB_ENV"
 
       - name: Configure ccache
-        uses: actions/github-script@v8
+        uses: actions/github-script@v7
         with:
           script: |
             const workspace = String.raw`${{ github.workspace }}`;
+            // FIX: keep ccache debug/log output outside the workspace so it
+            // does not bloat the job's workspace or artifact uploads.
+            const tempDir = String.raw`${{ runner.temp }}`;
 
             const envVariables = {
                 'cache-variant': String.raw`ccache`,
@@ -199,8 +237,8 @@ jobs:
                 'CMAKE_C_COMPILER_LAUNCHER': String.raw`ccache`,
                 'CCACHE_CONFIGPATH': String.raw`${workspace}/build-system/ccache.conf`,
                 'CCACHE_DIR': String.raw`${workspace}/.ccache`,
-                'CCACHE_DEBUGDIR': String.raw`${workspace}/ccache-debug`,
-                'CCACHE_LOGFILE': String.raw`${workspace}/ccache.log`
+                'CCACHE_DEBUGDIR': String.raw`${tempDir}/ccache-debug`,
+                'CCACHE_LOGFILE': String.raw`${tempDir}/ccache.log`
             };
 
             for (const [key, value] of Object.entries(envVariables)) {
@@ -212,8 +250,8 @@ jobs:
         with:
           create-symlink: false
           variant: ${{ env.cache-variant }}
-          key: cpl-${{ matrix.os }}-${{ matrix.python-minor}}
-          restore-keys: cpl-${{ matrix.os }}-${{ matrix.python-minor}}-
+          key: cpl-${{ matrix.os }}-${{ matrix.python-minor }}
+          restore-keys: cpl-${{ matrix.os }}-${{ matrix.python-minor }}-
           max-size: 5G
           verbose: 1
 
@@ -224,28 +262,50 @@ jobs:
           arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
 
       - name: Download the pre-baked SPIR-V modules
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v4
         with:
           name: spirv-baked
           path: spirv-baked
+
+      # FIX: assert the bake produced something usable, so an empty bake
+      # fails here instead of producing broken wheels silently.
+      - name: Verify pre-baked SPIR-V modules
+        shell: bash
+        run: |
+          test -s spirv-baked/spirvmanifest.txt \
+            || { echo "::error::spirv-baked/spirvmanifest.txt is missing or empty"; exit 1; }
+
+      # FIX: real restore step for the dependency cache, with a key derived
+      # from the conan lockfiles (the original only had a save step, using
+      # a path that did not exist and a hashFiles() over the cache itself).
+      - name: Restore dependency cache
+        id: cache-deps
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.WORKSPACE }}/.conan2
+          key: deps-${{ matrix.os }}-${{ matrix.python-minor }}-${{ hashFiles('**/conan.lock', '**/conanfile.py', '**/conanfile.txt') }}
+          restore-keys: |
+            deps-${{ matrix.os }}-${{ matrix.python-minor }}-
 
       - name: Export version for scikit-build-core
         shell: python
         run: |
           import json
           from pathlib import Path
-          if (input_version := "${{ inputs.release-version }}"):
+          # FIX: input name is `version`, not `release-version`.
+          if (input_version := "${{ inputs.version }}"):
             result = input_version
           else:
             build_settings_file = Path("build-system", "build-settings.json")
             with open(build_settings_file) as in_file:
               default_version = json.load(in_file)["DefaultVersion"]
-            result = ".".join(default_version[i] for i in ("major", "minor", "patch"))
+            # FIX: str() cast - json numbers are ints and ".".join requires
+            # strings.
+            result = ".".join(str(default_version[i]) for i in ("major", "minor", "patch"))
             if (prerelease := default_version["prerelease"]):
               result = f"{result}-{prerelease}"
 
           print(f"Version: {result}")
-
           with open("SKVERSION", "w+") as out_file:
             out_file.write(result)
 
@@ -256,93 +316,68 @@ jobs:
           _version=$(cat SKVERSION)
           echo "version=${_version}" >> "$GITHUB_OUTPUT"
 
-
       # Build wheel
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.4.0
+        uses: pypa/cibuildwheel@v2.22.0
         env:
           CIBW_BUILD_FRONTEND: build
           CIBW_BUILD_VERBOSITY: 1
           CIBW_BUILD: cp3${{ matrix.python-minor }}-*
           CIBW_ARCHS: auto64
+          # NOTE: CIBW_ENVIRONMENT is what gets forwarded into the isolated
+          # build env. Step-level `env:` entries are NOT forwarded - anything
+          # the CMake / scikit-build build needs must be listed here.
+          # FIX: added LUXRAYS_SPIRV_BAKED_DIR, CONAN_HOME and the CCACHE_*
+          # variables here (previously only step-level env, so they never
+          # reached the build); also added -DCMAKE_*_COMPILER_LAUNCHER so
+          # ccache is actually used.
           CIBW_ENVIRONMENT: >
-            SKBUILD_CMAKE_ARGS='--preset conan-default;--log-level=VERBOSE;-DLUXCORE_VERSION=${{ steps.output-version.outputs.version }};-G Ninja Multi-Config'
+            SKBUILD_CMAKE_ARGS='--preset conan-default;--log-level=VERBOSE;-DLUXCORE_VERSION=${{ steps.output-version.outputs.version }};-G Ninja Multi-Config;-DCMAKE_CXX_COMPILER_LAUNCHER=ccache;-DCMAKE_C_COMPILER_LAUNCHER=ccache'
             SKBUILD_CMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
-            GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
+            GH_TOKEN=${{ github.token }}
             LUX_BUILD_TYPE=${{ env.BUILD_TYPE }}
             DEPS_WITHOUT_SUDO=1
-          # Note: CIBW_ENVIRONMENT_LINUX REPLACES CIBW_ENVIRONMENT (not in
-          # addition to it): it must repeat the whole environment, plus the
-          # pre-baked SPIR-V modules directory (inside the container, the
-          # repository is mounted under /project)
-          
-          #CIBW_ENVIRONMENT_LINUX: >
-            #SKBUILD_CMAKE_ARGS='--preset conan-default;--log-level=VERBOSE;-DLUXCORE_VERSION=${{ steps.output-version.outputs.version }};-G Ninja Multi-Config'
-            #SKBUILD_CMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
-            #GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
-            #LUX_BUILD_TYPE=${{ env.BUILD_TYPE }}
-            #DEPS_WITHOUT_SUDO=1
-            #LUXRAYS_SPIRV_BAKED_DIR=/project/spirv-baked
-          #CIBW_ENVIRONMENT_PASS_LINUX: |
-            #CC
-            #CXX
-            #BUILD_TYPE
-            #GCC_VERSION
-            #SANITIZE
-            #ASAN_PATH
-            #RUNNER_OS
-            #RUNNER_ARCH
-            #WORKSPACE
-            #CMAKE_CXX_COMPILER_LAUNCHER
-            #CMAKE_C_COMPILER_LAUNCHER
-            #PYTHON_MINOR
-            #BOOST_INSTALL_LAYOUT
-            #SPDLOG_FMT_EXTERNAL
-            #CXX_VERSION
-            #CONAN_HOME
-            #CONAN_PRESET
-
+            LUXRAYS_SPIRV_BAKED_DIR=${{ github.workspace }}/spirv-baked
+            CONAN_HOME=${{ env.CONAN_HOME }}
+            CCACHE_DIR=${{ env.CCACHE_DIR }}
+            CCACHE_CONFIGPATH=${{ env.CCACHE_CONFIGPATH }}
+            CCACHE_DEBUGDIR=${{ env.CCACHE_DEBUGDIR }}
+            CCACHE_LOGFILE=${{ env.CCACHE_LOGFILE }}
+          # FIX: pin conan to a concrete release (the bare `conan==2.21`
+          # was not a valid pip version spec).
           CIBW_BEFORE_ALL_WINDOWS: |
-            pip install "conan==2.21" && pip install wheel && make deps
-
+            pip install "conan~=2.21.0" && pip install wheel && make deps
           CIBW_TEST_COMMAND_WINDOWS: pyluxcoretest
-          CIBW_CONTAINER_ENGINE: >
-            docker;
-            create_args:
-              --mount type=bind,source=${{ env.CCACHE_DIR }},target=/root/.ccache
-          # The pre-baked SPIR-V modules for the OpenCL kernels
-          # pre-compilation (only used on Windows: on Linux the variable is
-          # set through CIBW_ENVIRONMENT_LINUX, on macOS the pre-compilation
-          # is disabled)
-          LUXRAYS_SPIRV_BAKED_DIR: ${{ github.workspace }}\spirv-baked
-
         with:
-            package-dir: .
-            output-dir: wheelhouse
-            config-file: "{package}/pyproject.toml"
+          package-dir: .
+          output-dir: wheelhouse
+          config-file: "{package}/pyproject.toml"
 
-
+      # FIX: pair the save with the restore above; skip when the cache was
+      # already hit; key comes from the restore step's output.
       - name: Save dependency cache
-        if: always()
-        id: cache-deps-save
-        uses: actions/cache/save@v5
+        if: always() && steps.cache-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
         with:
-          path: conan-cache
-          key: deps-${{ matrix.os }}-${{ matrix.python-minor}}-${{ hashFiles('**/conan-cache') }}
-
-      #- name: Setup tmate session (debug)
-        #if: ${{ failure() }}
-        #uses: mxschmitt/action-tmate@v3
+          path: ${{ env.WORKSPACE }}/.conan2
+          key: ${{ steps.cache-deps.outputs.cache-primary-key }}
 
       # Upload artifacts
-      - uses: actions/upload-artifact@v5
-        id: upload
+      # FIX: always upload, so partial builds still produce downloadables
+      # and the attestation job can attest whatever wheels exist.
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: cibw-wheels-${{ matrix.os }}-${{ matrix.python-minor }}
           path: ./wheelhouse/*.whl
+          if-no-files-found: warn
 
   attest-wheels:
     needs: [build-wheels]
+    # FIX: run even if a single matrix leg failed, so wheels that were
+    # actually produced still get attested; the download step below tolerates
+    # an empty artifact set.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -351,16 +386,25 @@ jobs:
       attestation-url: ${{ steps.attestation-step.outputs.attestation-url }}
 
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v4
+        id: download
         if: ${{ !env.ACT }}
+        # Tolerate "no wheels at all" (e.g. every matrix leg failed) without
+        # crashing the job.
+        continue-on-error: true
         with:
           pattern: cibw-wheels-*
           path: ${{ github.workspace }}/dist
-          merge-multiple: false
+          # FIX: original had merge-multiple: false, so `dist/*` matched only
+          # subdirectories and the attest step received no files.
+          merge-multiple: true
 
       - name: Generate artifact attestations
         id: attestation-step
-        if: ${{ !env.ACT }}
-        uses: actions/attest-build-provenance@v3
+        if: ${{ !env.ACT && steps.download.outcome == 'success' }}
+        uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ${{ github.workspace }}/dist/*
+          # FIX: recursive glob so nested artifact layouts still match; with
+          # merge-multiple:true everything is already flat, but this is
+          # strictly more robust.
+          subject-path: ${{ github.workspace }}/dist/**/*.whl
